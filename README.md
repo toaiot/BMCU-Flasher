@@ -23,6 +23,8 @@
 3. Start the app → select **Native USB (manual BOOT+RESET)** → the status row turns green when ready
 4. Click **Flash** → after it finishes, remove USB, reconnect 24V, wait ~4 min for channel calibration
 
+![toaiot Native USB mode](gui_toaiot.png)
+
 CLI: `python3 bmcu_flasher.py firmware.bin --mode native_usb`
 
 Driver requirements (Native USB mode only):
