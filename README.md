@@ -1,3 +1,42 @@
+<h1 align="center">⚡ toaiot Custom Build — Native USB</h1>
+
+<p align="center">
+  Custom fork of <a href="https://github.com/jarczakpawel/BMCU-Flasher">BMCU-Flasher</a>
+  (upstream <strong>v1.3</strong>) by <strong>toaiot</strong>, adding a
+  <strong>Native USB</strong> flashing mode.
+</p>
+
+## What's new vs upstream v1.3
+
+| Feature | Description |
+|---|---|
+| **Native USB mode** | Flash via the CH32V203 built-in USB ISP bootloader (device `4348:55E0`) — no CH340 / serial cable needed |
+| **No-power workflow** | Remove 24V, plug USB only → chip auto-enters bootloader (no BOOT/RESET pressing) |
+| **Device status row** | GUI shows live WCH ISP device detection before flashing |
+| **Packaged drivers** | All builds bundle pyusb/libusb; Windows build includes `CH375DLL64.dll` |
+| **24V-safe prompts** | Pre/post-flash instructions adapted for 24V-disconnected flashing |
+
+## How to use Native USB mode
+
+1. **Remove 24V power** from the BMCU board (never plug USB while 24V is connected)
+2. Plug the USB cable into the BMCU's native USB port — it enters bootloader automatically
+3. Start the app → select **Native USB (manual BOOT+RESET)** → the status row turns green when ready
+4. Click **Flash** → after it finishes, remove USB, reconnect 24V, wait ~4 min for channel calibration
+
+CLI: `python3 bmcu_flasher.py firmware.bin --mode native_usb`
+
+Driver requirements (Native USB mode only):
+
+| Platform | Requirement |
+|---|---|
+| Windows | WCH CH372 driver (CH375DLL64.dll bundled) or WinUSB via Zadig |
+| Linux | udev rule: `SUBSYSTEM=="usb", ATTRS{idVendor}=="4348", ATTRS{idProduct}=="55e0", MODE="0666"` |
+| macOS | none (libusb bundled) |
+
+> ⚠️ **Important**: flashing is only supported with **24V disconnected**. Never plug USB while the board is powered by 24V.
+
+---
+
 <h1 align="center">Support</h1>
 
 <p align="center">

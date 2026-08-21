@@ -17,7 +17,7 @@ if SCRIPT_DIR not in sys.path:
 import bmcu_flasher
 
 APP_NAME = "BMCU Flasher"
-APP_VERSION = "1.3"
+APP_VERSION = "1.3-toaiot-native-usb"
 
 FW_URL = "https://github.com/jarczakpawel/BMCU-C-PJARCZAK"
 APP_URL = "https://github.com/jarczakpawel/BMCU-Flasher"
