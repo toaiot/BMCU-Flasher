@@ -181,7 +181,7 @@ class App(tk.Tk):
         self._load_i18n()
 
         self.var_mode = tk.StringVar(value=self.cfg.get("mode", "usb") or "usb")
-        if self.var_mode.get() not in ("usb", "ttl"):
+        if self.var_mode.get() not in ("usb", "ttl", "native_usb"):
             self.var_mode.set("usb")
 
         self.var_vid = tk.StringVar(value=self.cfg.get("vid", "0x1a86"))
@@ -219,6 +219,11 @@ class App(tk.Tk):
 
         self._row_adapter_lbl = None
         self._row_adapter_cell = None
+        self._row_port_lbl = None
+        self._row_port_cell = None
+        self._row_port_btns = None
+        self._nusb_row = None
+        self._nusb_status = None
 
         self.cmb_lang = None
         self.cmb_adapter = None
@@ -555,6 +560,7 @@ class App(tk.Tk):
         mode_box = ttk.Frame(cfg)
         mode_box.grid(row=r, column=1, sticky="w", pady=(0, 10))
         ttk.Radiobutton(mode_box, text=self.T("mode_usb"), variable=self.var_mode, value="usb", command=self._on_mode_change).pack(side="left")
+        ttk.Radiobutton(mode_box, text=self.T("mode_native_usb"), variable=self.var_mode, value="native_usb", command=self._on_mode_change).pack(side="left", padx=(18, 0))
         ttk.Radiobutton(mode_box, text=self.T("mode_ttl"), variable=self.var_mode, value="ttl", command=self._on_mode_change).pack(side="left", padx=(18, 0))
         r += 1
 
@@ -577,15 +583,26 @@ class App(tk.Tk):
         self.ent_pid.pack(side="left")
         r += 1
 
-        ttk.Label(cfg, text=self.T("port_label")).grid(row=r, column=0, sticky="w", pady=(0, 10))
-        self.cmb_ports = ttk.Combobox(cfg, textvariable=self.var_port_disp, state="readonly")
-        self.cmb_ports.grid(row=r, column=1, sticky="we", pady=(0, 10), ipady=4)
+        self._row_port_lbl = ttk.Label(cfg, text=self.T("port_label"))
+        self._row_port_lbl.grid(row=r, column=0, sticky="w", pady=(0, 10))
+        self._row_port_cell = ttk.Frame(cfg)
+        self._row_port_cell.grid(row=r, column=1, sticky="we", pady=(0, 10))
+        self.cmb_ports = ttk.Combobox(self._row_port_cell, textvariable=self.var_port_disp, state="readonly")
+        self.cmb_ports.pack(fill="x", ipady=4)
         self.cmb_ports.bind("<<ComboboxSelected>>", self._on_port_selected)
 
-        port_btns = ttk.Frame(cfg)
-        port_btns.grid(row=r, column=2, sticky="e", pady=(0, 10))
-        self.btn_refresh = ttk.Button(port_btns, text=self.T("refresh"), command=self._refresh_ports)
+        self._row_port_btns = ttk.Frame(cfg)
+        self._row_port_btns.grid(row=r, column=2, sticky="e", pady=(0, 10))
+        self.btn_refresh = ttk.Button(self._row_port_btns, text=self.T("refresh"), command=self._refresh_ports)
         self.btn_refresh.pack(side="left")
+
+        # Native USB 模式的状态行（替代端口行）：显示是否已检测到 WCH ISP 设备
+        self._nusb_row = ttk.Frame(cfg)
+        self._nusb_row.grid(row=r, column=1, sticky="we", pady=(0, 10))
+        self._nusb_status = tk.Label(self._nusb_row, bg=BG, fg=FG, anchor="w", justify="left", wraplength=520)
+        self._nusb_status.pack(side="left", fill="x", expand=True)
+        ttk.Button(self._nusb_row, text=self.T("refresh"), command=self._refresh_ports).pack(side="right")
+        self._nusb_row.grid_remove()
         r += 1
 
         ttk.Label(cfg, text=self.T("firmware_label")).grid(row=r, column=0, sticky="w", pady=(0, 10))
@@ -729,9 +746,29 @@ class App(tk.Tk):
             self._force_ch340()
             self._set_row_visible(self._row_adapter_lbl, False)
             self._set_row_visible(self._row_adapter_cell, False)
+            self._set_row_visible(self._row_port_lbl, True)
+            self._set_row_visible(self._row_port_cell, True)
+            self._set_row_visible(self._row_port_btns, True)
+            if self._nusb_row is not None:
+                self._nusb_row.grid_remove()
+        elif mode == "native_usb":
+            # 原生 USB：无串口/VID/PID，隐藏端口行，显示 WCH ISP 设备状态
+            self._set_row_visible(self._row_adapter_lbl, False)
+            self._set_row_visible(self._row_adapter_cell, False)
+            self._set_row_visible(self._row_port_lbl, False)
+            self._set_row_visible(self._row_port_cell, False)
+            self._set_row_visible(self._row_port_btns, False)
+            if self._nusb_row is not None:
+                self._nusb_row.grid()
+            self._refresh_nusb_status()
         else:
             self._set_row_visible(self._row_adapter_lbl, True)
             self._set_row_visible(self._row_adapter_cell, True)
+            self._set_row_visible(self._row_port_lbl, True)
+            self._set_row_visible(self._row_port_cell, True)
+            self._set_row_visible(self._row_port_btns, True)
+            if self._nusb_row is not None:
+                self._nusb_row.grid_remove()
             if not init:
                 name = (self.var_adapter.get() or "").strip()
                 self._apply_adapter_presets(name, save=True)
@@ -931,7 +968,7 @@ class App(tk.Tk):
         step(0)
 
     def _ttl_hint_show(self):
-        if self.var_mode.get() != "ttl":
+        if self.var_mode.get() not in ("ttl", "native_usb"):
             return
         if not self._ttl_hint_border:
             return
@@ -1011,7 +1048,7 @@ class App(tk.Tk):
                 if ev[0] == "log":
                     _, ts, level, msg = ev
                     tags = ("action",) if level == "ACTION" else ()
-                    if level == "ACTION" and self.var_mode.get() == "ttl":
+                    if level == "ACTION" and self.var_mode.get() in ("ttl", "native_usb"):
                         if "enter bootloader now" in msg:
                             self._ttl_hint_show()
                     if "bootloader detected" in msg:
@@ -1028,7 +1065,10 @@ class App(tk.Tk):
                     self.btn_flash.config(state="normal")
                     self._ttl_hint_hide()
                     if ok:
-                        messagebox.showinfo(APP_NAME, self.T("ok"))
+                        if self.var_mode.get() == "native_usb":
+                            messagebox.showinfo(APP_NAME, self.T("flash_done_nusb"))
+                        else:
+                            messagebox.showinfo(APP_NAME, self.T("ok"))
                     else:
                         messagebox.showerror(APP_NAME, msg or self.T("err_generic"))
                 elif ev[0] == "ver":
@@ -1089,8 +1129,28 @@ class App(tk.Tk):
             return ps, False
         return [], True
 
+    def _refresh_nusb_status(self):
+        """native_usb：实时检测 WCH ISP 设备（设备出现 = 已进 bootloader）。"""
+        if self._nusb_status is None:
+            return
+        try:
+            devs = bmcu_flasher.list_usb_isp_devices()
+        except Exception as e:
+            devs = []
+            self._enqueue_log("WARN", f"nusb probe failed: {e}")
+        if devs:
+            self._nusb_status.config(
+                text=self.T("nusb_status_ok").format(dev=devs[0]), fg=PB_GREEN)
+        else:
+            self._nusb_status.config(text=self.T("nusb_status_none"), fg=WARN_RED)
+
     def _refresh_ports(self):
         mode = self.var_mode.get()
+
+        if mode == "native_usb":
+            self._refresh_nusb_status()
+            return
+
         ports = []
         fallback = False
 
@@ -1411,6 +1471,12 @@ class App(tk.Tk):
         tk.Label(left, text=self.T("help_step3"), bg=BG, fg=FG, font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 0))
         tk.Label(left, text=self.T("help_usb_s3"), bg=BG, fg=FG, justify="left").pack(anchor="w", padx=24)
 
+        tk.Label(left, text=self.T("help_nusb_title"), bg=BG, fg=FG, font=("TkDefaultFont", 12, "bold")).pack(anchor="w", padx=12, pady=(16, 6))
+        tk.Label(left, text=self.T("help_step1"), bg=BG, fg=FG, font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=12, pady=(6, 0))
+        tk.Label(left, text=self.T("help_nusb_s1"), bg=BG, fg=FG, justify="left").pack(anchor="w", padx=24)
+        tk.Label(left, text=self.T("help_step2"), bg=BG, fg=FG, font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 0))
+        tk.Label(left, text=self.T("help_nusb_s2"), bg=BG, fg=FG, justify="left").pack(anchor="w", padx=24)
+
         tk.Label(right, text=self.T("help_ttl_title"), bg=BG, fg=FG, font=("TkDefaultFont", 12, "bold")).pack(anchor="w", padx=12, pady=(12, 6))
         tk.Label(right, text=self.T("help_step1"), bg=BG, fg=FG, font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=12, pady=(6, 0))
         tk.Label(right, text=self.T("help_ttl_s1"), bg=BG, fg=FG, justify="left").pack(anchor="w", padx=24)
@@ -1501,7 +1567,7 @@ class App(tk.Tk):
                 return
 
         port = (self.var_port.get() or "").strip()
-        if not port:
+        if not port and self.var_mode.get() != "native_usb":
             messagebox.showerror(APP_NAME, self.T("err_select_port"))
             return
 

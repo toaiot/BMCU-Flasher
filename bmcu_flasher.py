@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
 import os
 import struct
+import sys
 import time
 import hashlib
 import zlib
@@ -224,6 +226,253 @@ class WchIsp:
         self.ser.write(pkt)
         return self.recv(expect_cmd, timeout_s)
 
+
+# ============================================================
+# Native USB 传输：CH32V203 内置 USB ISP bootloader 下载通道
+# （BOOT0=1 + 复位 后芯片枚举为 WCH ISP 设备 4348:55E0 / 1A86:55E0）
+#
+# 帧格式（真机实测，与串口帧的差异）：
+#   串口 TX: 57 AB [cmd][len][data] [ck]
+#   USB  TX: [cmd][len][data]            （无 57AB 头、无校验和）
+#   串口 RX: 55 AA [cmd][code][len][data] [ck]
+#   USB  RX: [cmd][code][len][data]      （无 55AA 头、无校验和）
+#
+# 后端选择：
+#   1) Windows + CH375DLL64.dll（WCH 官方驱动，嵌入式环境最常见）
+#   2) pyusb + libusb（WinUSB 驱动 / Linux / macOS）
+# ============================================================
+
+USB_ISP_VIDS = (0x4348, 0x1A86)
+USB_ISP_PID = 0x55E0
+
+
+class _Ch375DevDescr(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("bLength", ctypes.c_uint8), ("bDescriptorType", ctypes.c_uint8),
+        ("bcdUSB", ctypes.c_uint16), ("bDeviceClass", ctypes.c_uint8),
+        ("bDeviceSubClass", ctypes.c_uint8), ("bDeviceProtocol", ctypes.c_uint8),
+        ("bMaxPacketSize0", ctypes.c_uint8), ("idVendor", ctypes.c_uint16),
+        ("idProduct", ctypes.c_uint16), ("bcdDevice", ctypes.c_uint16),
+        ("iManufacturer", ctypes.c_uint8), ("iProduct", ctypes.c_uint8),
+        ("iSerialNumber", ctypes.c_uint8), ("bNumConfigurations", ctypes.c_uint8),
+    ]
+
+
+def _ch375_dll():
+    """Windows: 加载 CH375DLL64.dll 并绑定函数签名；失败返回 None。
+
+    搜索顺序：系统默认路径（System32 等）→ PyInstaller 打包目录（_MEIPASS，
+    适配 --add-binary 把 DLL 放进 _internal/ 的 onedir 布局）。
+    """
+    if os.name != "nt":
+        return None
+    dll = None
+    try:
+        dll = ctypes.WinDLL("CH375DLL64.dll")
+    except OSError:
+        # 打包后 DLL 在 _internal/ 下，按名加载找不到，用 _MEIPASS 兜底
+        base = getattr(sys, "_MEIPASS", "") or os.path.dirname(os.path.abspath(__file__))
+        try:
+            dll = ctypes.WinDLL(os.path.join(base, "CH375DLL64.dll"))
+        except OSError:
+            dll = None
+    if dll is None:
+        return None
+    try:
+        dll.CH375GetVersion.restype = ctypes.c_uint32
+        dll.CH375GetVersion()  # 探活
+        dll.CH375OpenDevice.argtypes = [ctypes.c_uint32]
+        dll.CH375OpenDevice.restype = ctypes.c_uint32
+        dll.CH375CloseDevice.argtypes = [ctypes.c_uint32]
+        dll.CH375GetDeviceDescr.argtypes = [
+            ctypes.c_uint32, ctypes.POINTER(_Ch375DevDescr), ctypes.POINTER(ctypes.c_uint32),
+        ]
+        dll.CH375GetDeviceDescr.restype = ctypes.c_bool
+        dll.CH375WriteData.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        dll.CH375WriteData.restype = ctypes.c_bool
+        dll.CH375ReadData.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        dll.CH375ReadData.restype = ctypes.c_bool
+        return dll
+    except Exception:
+        return None
+
+
+def _ch375_find_isp(dll):
+    """扫描 CH375 设备索引 0..7，返回第一个 WCH ISP 设备的索引；没有则 None。"""
+    INVALID = 0xFFFFFFFF
+    for i in range(8):
+        try:
+            h = dll.CH375OpenDevice(i)
+            if h == INVALID:
+                continue
+            d = _Ch375DevDescr()
+            ln = ctypes.c_uint32(ctypes.sizeof(_Ch375DevDescr))
+            dll.CH375GetDeviceDescr(i, ctypes.byref(d), ctypes.byref(ln))
+            if d.idVendor in USB_ISP_VIDS and d.idProduct == USB_ISP_PID:
+                return i
+        except Exception:
+            continue
+        finally:
+            try:
+                dll.CH375CloseDevice(i)
+            except Exception:
+                pass
+    return None
+
+
+def list_usb_isp_devices():
+    """列出当前可见的 WCH ISP USB 设备（用于 --list）。"""
+    out = []
+    dll = _ch375_dll()
+    if dll is not None:
+        idx = _ch375_find_isp(dll)
+        if idx is not None:
+            out.append(f"WCH-ISP ch375#{idx} (4348:55E0)")
+    try:
+        import usb.core  # type: ignore
+        for vid in USB_ISP_VIDS:
+            dev = usb.core.find(idVendor=vid, idProduct=USB_ISP_PID)
+            if dev is not None:
+                out.append(f"WCH-ISP usb (bus {dev.bus} addr {dev.address}) {vid:04x}:{USB_ISP_PID:04x}")
+                break
+    except Exception:
+        pass
+    return out
+
+
+class WchIspUsb:
+    """WCH ISP over native USB，接口与 WchIsp 对齐（open/close/flush/set_baud/txrx）。"""
+
+    def __init__(self, trace: bool = False):
+        self.trace = trace
+        self.baud = 115200  # 占位：USB 无波特率概念
+        self._dll = None
+        self._idx = None
+        self._dev = None
+        self._ep_out = None
+        self._ep_in = None
+        self._rx = bytearray()
+
+    # ---------------- 连接 ----------------
+    def open(self):
+        dll = _ch375_dll()
+        if dll is not None:
+            idx = _ch375_find_isp(dll)
+            if idx is not None:
+                # CH375 约定：必须 CH375OpenDevice 保持打开，后续读写才有效
+                h = dll.CH375OpenDevice(idx)
+                if h != 0xFFFFFFFF:
+                    self._dll = dll
+                    self._idx = idx
+                    return
+        try:
+            import usb.core  # type: ignore
+            import usb.util  # type: ignore
+            dev = None
+            for vid in USB_ISP_VIDS:
+                dev = usb.core.find(idVendor=vid, idProduct=USB_ISP_PID)
+                if dev is not None:
+                    break
+            if dev is not None:
+                dev.set_configuration()
+                intf = dev.get_active_configuration()[(0, 0)]
+                ep_out = usb.util.find_descriptor(
+                    intf,
+                    custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT,
+                )
+                ep_in = usb.util.find_descriptor(
+                    intf,
+                    custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN,
+                )
+                if ep_out is not None and ep_in is not None:
+                    self._dev = dev
+                    self._ep_out = ep_out
+                    self._ep_in = ep_in
+                    return
+        except Exception:
+            pass
+        raise RuntimeError(
+            "native_usb: no WCH ISP USB device (4348:55E0). "
+            "enter bootloader first (hold BOOT + tap RESET), and check driver: "
+            "Windows = WCH CH375 driver (CH375DLL64.dll) or WinUSB via Zadig; "
+            "Linux = udev rules + libusb"
+        )
+
+    def close(self):
+        if self._idx is not None and self._dll is not None:
+            try:
+                self._dll.CH375CloseDevice(self._idx)
+            except Exception:
+                pass
+        if self._dev is not None:
+            try:
+                import usb.util  # type: ignore
+                usb.util.dispose_resources(self._dev)
+            except Exception:
+                pass
+        self._dll = None
+        self._idx = None
+        self._dev = None
+        self._ep_out = None
+        self._ep_in = None
+        self._rx.clear()
+
+    def flush(self):
+        self._rx.clear()
+
+    def set_baud(self, baud: int):
+        self.baud = baud  # USB 无波特率，仅记录
+
+    # ---------------- 帧收发 ----------------
+    def txrx(self, pkt: bytes, expect_cmd: int, timeout_s: float):
+        """pkt 为串口格式帧 [57 AB][cmd][len][data][ck]，剥离头尾后走 USB。"""
+        raw_tx = pkt[2:-1]
+        if self.trace:
+            print(f"TX {raw_tx.hex()}")
+        raw_rx = self._write_read(raw_tx, timeout_s)
+        if len(raw_rx) < 4:
+            raise TimeoutError(f"short USB response ({len(raw_rx)}B)")
+        cmd, code = raw_rx[0], raw_rx[1]
+        ln = raw_rx[2] | (raw_rx[3] << 8)
+        data = raw_rx[4:4 + ln]
+        if self.trace:
+            print(f"RX cmd=0x{cmd:02x} code=0x{code:02x} ln={ln} data={data.hex()}")
+        if cmd != expect_cmd:
+            raise RuntimeError(f"usb cmd mismatch: got 0x{cmd:02x}, want 0x{expect_cmd:02x}")
+        return code, data
+
+    def _write_read(self, raw_tx: bytes, timeout_s: float):
+        end = time.monotonic() + timeout_s
+        if self._dll is not None and self._idx is not None:
+            wlen = ctypes.c_uint32(len(raw_tx))
+            buf = ctypes.create_string_buffer(raw_tx)
+            if not self._dll.CH375WriteData(self._idx, buf, ctypes.byref(wlen)):
+                raise RuntimeError("CH375WriteData failed")
+            rbuf = ctypes.create_string_buffer(64)
+            while True:
+                rlen = ctypes.c_uint32(64)
+                ok = self._dll.CH375ReadData(self._idx, rbuf, ctypes.byref(rlen))
+                if ok and rlen.value > 0:
+                    return rbuf.raw[: rlen.value]
+                if time.monotonic() >= end:
+                    raise TimeoutError(f"usb read timeout after {timeout_s:.1f}s")
+                time.sleep(0.005)
+        if self._dev is not None:
+            import usb.core  # type: ignore
+            self._ep_out.write(raw_tx, timeout=max(100, int(timeout_s * 1000)))
+            while True:
+                remain = end - time.monotonic()
+                if remain <= 0:
+                    raise TimeoutError(f"usb read timeout after {timeout_s:.1f}s")
+                try:
+                    r = self._ep_in.read(64, timeout=min(remain, 1.0) * 1000)
+                    return bytes(r)
+                except usb.core.USBTimeoutError:
+                    continue
+        raise RuntimeError("usb transport not open")
+
+
 def set_lines(isp: WchIsp, boot_is_dtr: bool, boot_val: bool, reset_val: bool):
     if boot_is_dtr:
         isp.ser.dtr = boot_val
@@ -304,7 +553,7 @@ def flash_firmware(
     log_cb=None,
     progress_cb=None,
 ):
-    if mode not in ("usb", "ttl"):
+    if mode not in ("usb", "ttl", "native_usb"):
         raise ValueError("bad mode")
 
     if not os.path.isfile(firmware_path):
@@ -315,8 +564,9 @@ def flash_firmware(
             port = auto_pick_port(vid, pid)
             if not port:
                 raise RuntimeError(f"no port for vid=0x{vid:04x} pid=0x{pid:04x}")
-        else:
+        elif mode == "ttl":
             raise RuntimeError("ttl mode requires --port (no vid/pid filtering)")
+        # native_usb: 不需要串口，USB 设备自动查找
 
     fw = open(firmware_path, "rb").read()
     blocks = (len(fw) + BMCU_CHUNK - 1) // BMCU_CHUNK
@@ -330,8 +580,12 @@ def flash_firmware(
     parity_v = parity_map[parity]
 
     t0 = time.monotonic()
-    isp = WchIsp(port, baud, parity_v, trace)
-    isp.open()
+    if mode == "native_usb":
+        isp = WchIspUsb(trace)
+        # 不立即 open：先提示用户进 bootloader，USB 设备出现后再连接
+    else:
+        isp = WchIsp(port, baud, parity_v, trace)
+        isp.open()
 
     identify_pkt = build_identify(BMCU_DEVICE_ID, BMCU_DEVICE_TYPE)
 
@@ -343,8 +597,10 @@ def flash_firmware(
             isp.close()
             raise RuntimeError("autodi failed (usb mode)")
         _log(log_cb, "INFO", f"autodi ok boot_is_dtr={int(autodi[0])} boot_assert={int(autodi[1])} reset_assert={int(autodi[2])}")
-    else:
+    elif mode == "ttl":
         _log(log_cb, "ACTION", "ttl mode: enter bootloader now (hold BOOT, tap RESET). waiting for ISP...")
+    else:
+        _log(log_cb, "ACTION", "native_usb mode: remove 24V power, plug USB cable only (auto enters bootloader). waiting for USB ISP device...")
 
     _log(log_cb, "INFO", f"stage identify @ host_baud={isp.baud}")
 
@@ -364,6 +620,26 @@ def flash_firmware(
             if time.monotonic() >= end:
                 isp.close()
                 raise RuntimeError(f"identify failed (ttl). enter bootloader first. last={last_err}")
+            time.sleep(0.15)
+    elif mode == "native_usb":
+        # USB 设备可能还没插好/枚举，每次尝试重新打开（插拔后索引会变）
+        end = time.monotonic() + 12.0
+        last_err = None
+        while True:
+            try:
+                isp.close()
+                isp.open()
+                isp.flush()
+                code, data = isp.txrx(identify_pkt, CMD_IDENTIFY, 1.0)
+                if code == 0x00 and len(data) >= 2:
+                    _log(log_cb, "INFO", "bootloader detected (USB ISP active)")
+                    break
+                last_err = RuntimeError("identify bad response")
+            except Exception as e:
+                last_err = e
+            if time.monotonic() >= end:
+                isp.close()
+                raise RuntimeError(f"identify failed (native_usb). enter bootloader first. last={last_err}")
             time.sleep(0.15)
     else:
         code, data = isp.txrx(identify_pkt, CMD_IDENTIFY, 1.0)
@@ -453,7 +729,7 @@ def flash_firmware(
                 isp.close()
                 raise RuntimeError(f"identify failed (usb) after isp_end(01). last={last_err}")
             time.sleep(0.10)
-    else:
+    elif mode == "ttl":
         _log(log_cb, "ACTION", "ttl: re-enter bootloader now (hold BOOT, tap RESET). waiting for ISP...")
         end = time.monotonic() + 12.0
         last_err = None
@@ -469,6 +745,25 @@ def flash_firmware(
             if time.monotonic() >= end:
                 isp.close()
                 raise RuntimeError(f"identify failed (ttl) after isp_end(01). last={last_err}")
+            time.sleep(0.15)
+    else:  # native_usb：isp_end(01) 后芯片复位，USB 断开重枚举，必须 close+open 重试
+        _log(log_cb, "ACTION", "native_usb: option bytes applied, waiting for USB device to re-enumerate (keep USB plugged)...")
+        end = time.monotonic() + 12.0
+        last_err = None
+        while True:
+            try:
+                isp.close()
+                isp.open()
+                isp.flush()
+                code2, data2 = isp.txrx(identify_pkt, CMD_IDENTIFY, 1.0)
+                if code2 == 0x00 and len(data2) >= 2:
+                    break
+                last_err = RuntimeError("identify bad response")
+            except Exception as e:
+                last_err = e
+            if time.monotonic() >= end:
+                isp.close()
+                raise RuntimeError(f"identify failed (native_usb) after isp_end(01). last={last_err}")
             time.sleep(0.15)
 
     _log(log_cb, "INFO", "bootloader detected again (after isp_end(01))")
@@ -587,7 +882,7 @@ def flash_firmware(
         isp.close()
         raise RuntimeError(f"erase incomplete (tail not erased) addr=0x{tail_addr:08x}")
 
-    if not no_fast:
+    if not no_fast and mode != "native_usb":
         _log(log_cb, "INFO", f"stage set_baud mcu={fast_baud}")
         code, _ = isp.txrx(build_set_baud(int(fast_baud)), CMD_SET_BAUD, 1.2)
         if code != 0x00:
@@ -640,7 +935,7 @@ def flash_firmware(
     if progress_cb:
         progress_cb(50, blocks, blocks)
 
-    dt = time.monotonic() - tprog
+    dt = max(time.monotonic() - tprog, 1e-6)  # 防止极快烧录（小固件/USB）时 dt=0 除零
     kb = len(fw) / 1024.0
     _log(log_cb, "INFO", f"program done in {dt:.3f}s ({kb/dt:.1f} KiB/s)")
 
@@ -704,6 +999,8 @@ def flash_firmware(
         pulse_reset(isp, autodi[0], autodi[2])
 
     isp.close()
+    if mode == "native_usb":
+        _log(log_cb, "ACTION", "done. remove USB cable, connect 24V power, wait for channel calibration (~4 min)")
     if progress_cb:
         progress_cb(100, blocks, blocks)
     _log(log_cb, "INFO", f"OK total={time.monotonic()-t0:.3f}s")
@@ -881,7 +1178,7 @@ def remote_download_firmware(
 def main():
     ap = argparse.ArgumentParser(prog="bmcu_flasher.py")
     ap.add_argument("firmware")
-    ap.add_argument("--mode", choices=["usb", "ttl"], default="usb")
+    ap.add_argument("--mode", choices=["usb", "ttl", "native_usb"], default="usb")
     ap.add_argument("--port", default="")
     ap.add_argument("--vid", type=lambda x: int(x, 0), default=DEFAULT_VID)
     ap.add_argument("--pid", type=lambda x: int(x, 0), default=DEFAULT_PID)
@@ -908,6 +1205,14 @@ def main():
     args = ap.parse_args()
 
     if args.list:
+        if args.mode == "native_usb":
+            devs = list_usb_isp_devices()
+            if not devs:
+                print("no wch isp usb devices (enter bootloader first: hold BOOT + tap RESET)")
+                return
+            for d in devs:
+                print(d)
+            return
         if args.mode == "usb":
             ports = list_matching_ports(args.vid, args.pid)
         else:

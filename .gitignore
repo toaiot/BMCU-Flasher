@@ -1,0 +1,11 @@
+# 构建产物
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# 本地配置
+.config/

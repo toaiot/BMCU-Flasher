@@ -41,6 +41,7 @@ Cross-platform flasher for BMCU (WCH ISP protocol).
 - OS: Linux / Windows / macOS / Android
 - Modes:
   - USB (BMCU with CH340 on board, AutoDI)
+  - Native USB (BMCU's own USB port, manual BOOT + RESET, no CH340 needed)
   - TTL (pin header / external USB-Serial, manual BOOT + RESET)
 - Android:
   - USB (CH340 + USB OTG)
@@ -109,6 +110,14 @@ python3 bmcu_flasher.py firmware.bin --mode usb
 ```bash
   python3 bmcu_flasher.py firmware.bin --mode ttl --port /dev/ttyUSB0
 ```
+- Native USB (BMCU's own USB port, manual BOOT+RESET, no port required):
+```bash
+  python3 bmcu_flasher.py firmware.bin --mode native_usb
+```
+
+Native USB mode uses the CH32V203 built-in USB ISP bootloader (device 4348:55E0). Transport backends:
+- Windows: WCH CH375 driver (`CH375DLL64.dll`, no extra Python deps) or WinUSB via Zadig + `pyusb`
+- Linux/macOS: `pip install pyusb` + libusb (see wchisp udev rules: `SUBSYSTEM=="usb", ATTRS{idVendor}=="4348", ATTRS{idProduct}=="55e0", MODE="0666"`)
 
 ## License
 MIT - see LICENSE.
