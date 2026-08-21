@@ -35,7 +35,8 @@ Driver requirements (Native USB mode only):
 | Linux | udev rule: `SUBSYSTEM=="usb", ATTRS{idVendor}=="4348", ATTRS{idProduct}=="55e0", MODE="0666"` |
 | macOS | none (libusb bundled) |
 
-> ⚠️ **Important**: flashing is only supported with **24V disconnected**. Never plug USB while the board is powered by 24V.
+> [!WARNING]  
+> **Important**: flashing is only supported with **24V disconnected**. Never plug USB while the board is powered by 24V.
 
 ---
 
