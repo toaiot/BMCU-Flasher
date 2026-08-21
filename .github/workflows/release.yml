@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional: tag to release (defaults to current ref)"
+        required: false
 
 permissions:
   contents: write
